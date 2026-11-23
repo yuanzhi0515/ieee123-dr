@@ -1,0 +1,728 @@
+from pathlib import Path
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import copy
+import math
+
+from algo.encoder import Encoder, PowerPredictor, weight_init
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class Critic(nn.Module):
+    def __init__(
+        self,
+        encoder: Encoder,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int = 256,
+        use_norm: bool = False,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.use_norm = use_norm
+        self.hidden_dim = hidden_dim
+
+        input_dim = state_dim + action_dim
+        if encoder is not None:
+            input_dim = encoder.hidden_dim + action_dim
+        # Q1 architecture
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+
+        # Q2 architecture
+        self.fc4 = nn.Linear(input_dim, hidden_dim)
+        self.fc5 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc6 = nn.Linear(hidden_dim, 1)
+
+        self.norm1 = nn.LayerNorm(hidden_dim) if use_norm else nn.Identity()
+        self.norm2 = nn.LayerNorm(hidden_dim) if use_norm else nn.Identity()
+        self.norm4 = nn.LayerNorm(hidden_dim) if use_norm else nn.Identity()
+        self.norm5 = nn.LayerNorm(hidden_dim) if use_norm else nn.Identity()
+
+        self.apply(weight_init)
+
+    def forward(self, x, a, rnn_state=None):
+        feat, _ = self.encode(x, rnn_state)
+        feat = torch.cat([feat, a], dim=1)
+        q1 = F.relu(self.norm1(self.fc1(feat)))
+        q1 = F.relu(self.norm2(self.fc2(q1)))
+        q1 = self.fc3(q1)
+
+        q2 = F.relu(self.norm4(self.fc4(feat)))
+        q2 = F.relu(self.norm5(self.fc5(q2)))
+        q2 = self.fc6(q2)
+
+        return q1.squeeze(1), q2.squeeze(1)
+
+    def encode(self, x, rnn_state=None):
+        if self.encoder is not None:
+            feat, rnn_state = self.encoder(x, rnn_state)
+        else:
+            feat = x
+        return feat, rnn_state
+
+
+LOG_STD_MAX = 2
+LOG_STD_MIN = -5
+
+
+def gaussian_logprob(noise, log_std):
+    """Compute Gaussian log probability."""
+    residual = (-0.5 * noise.pow(2) - log_std).sum(-1, keepdim=True)
+    return residual - 0.5 * np.log(2 * np.pi) * noise.size(-1)
+
+
+class Actor(nn.Module):
+    def __init__(
+        self,
+        encoder: Encoder,
+        state_dim: int,
+        action_dim: int,
+        max_action: float = 1.0,
+        min_action: float = -1.0,
+        hidden_dim: int = 256,
+        use_norm: bool = False,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.use_norm = use_norm
+        input_dim = state_dim
+        if encoder is not None:
+            input_dim = encoder.hidden_dim
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim) if use_norm else nn.Identity()
+        self.norm2 = nn.LayerNorm(hidden_dim) if use_norm else nn.Identity()
+        self.fc_mean = nn.Linear(hidden_dim, action_dim)
+        self.fc_logstd = nn.Linear(hidden_dim, action_dim)
+        self.register_buffer(
+            "action_scale",
+            torch.tensor((max_action - min_action) / 2.0, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "action_bias",
+            torch.tensor((max_action + min_action) / 2.0, dtype=torch.float32),
+        )
+        self.apply(weight_init)
+
+    def forward(
+        self,
+        x,
+        rnn_state=None,
+        deterministic=False,
+        with_logprob=True,
+    ):
+        feat, rnn_state = self.encode(x, rnn_state)
+        feat = self.fc1(feat)
+        feat = self.norm1(feat)
+        feat = F.relu(feat)
+        feat = self.fc2(feat)
+        feat = self.norm2(feat)
+        feat = F.relu(feat)
+
+        mean = self.fc_mean(feat)
+        log_std = self.fc_logstd(feat)
+        # log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        log_std = torch.tanh(log_std)
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
+        std = log_std.exp()
+        # Only used for evaluating policy at test time.
+        if deterministic:
+            z = mean
+        else:
+            noise = torch.randn_like(
+                mean, requires_grad=True
+            )  # sampled from guassian distribution
+            z = mean + std * noise
+        tanh_z = torch.tanh(z)
+
+        if with_logprob and not deterministic:
+            logp_pi = gaussian_logprob(noise, log_std).sum(axis=-1)
+            logp_pi -= torch.log(F.relu(1.0 - tanh_z**2) + 1e-6).sum(axis=-1)
+        else:
+            logp_pi = None
+
+        action = self.action_scale * tanh_z + self.action_bias
+
+        return action, logp_pi, rnn_state
+
+    def encode(self, x, rnn_state=None):
+        if self.encoder is not None:
+            feat, rnn_state = self.encoder(x, rnn_state)
+        else:
+            feat = x
+        return feat, rnn_state
+
+
+class SAC(object):
+    def __init__(
+        self,
+        use_actor_encoder: int,
+        use_critic_encoder: int,
+        state_dim: int,
+        action_dim: int,
+        max_action: float = 1.0,
+        min_action: float = -1.0,
+        use_emb: bool = False,
+        use_actor_rnn: bool = True,
+        use_critic_rnn: bool = True,
+        rnn_num_layers: int = 1,
+        discount: float = 0.99,
+        tau: float = 0.005,
+        hidden_dim: int = 256,
+        use_norm: bool = True,
+        actor_lr: float = 3e-4,
+        critic_lr: float = 1e-3,
+        actor_update_step: int = 2,
+        reward_norm: float = 100.0,
+        time_enc_k: int = 4,
+        use_power_pred: bool = False,
+        pred_lr: float = 1e-3,
+        pred_loss_weight: float = 1.0,
+        use_action_mask: bool = True,
+        use_multi_goal: bool = False,
+        multi_goal_weight: float = 1.0,
+        n_step: int = 1,
+        autotune: bool = True,
+        alpha: float = 0.2,
+    ):
+        self.encoder = None
+        if time_enc_k > 0:
+            state_dim += 2 * time_enc_k
+        if use_actor_encoder == 1:
+            self.actor_encoder = Encoder(
+                state_dim=state_dim,
+                use_rnn=use_actor_rnn,
+                rnn_num_layers=rnn_num_layers,
+                hidden_dim=hidden_dim,
+                use_norm=use_norm,
+            ).to(device)
+        else:
+            self.actor_encoder = None
+        if use_critic_encoder == 1:
+            self.critic_encoder = Encoder(
+                state_dim=state_dim,
+                use_rnn=use_critic_rnn,
+                rnn_num_layers=rnn_num_layers,
+                hidden_dim=hidden_dim,
+                use_norm=use_norm,
+            ).to(device)
+        else:
+            self.critic_encoder = None
+
+        self.actor = Actor(
+            encoder=self.actor_encoder,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            max_action=max_action,
+            min_action=min_action,
+            hidden_dim=hidden_dim,
+            use_norm=use_norm,
+        ).to(device)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+
+        self.critic = Critic(
+            encoder=self.critic_encoder,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+            use_norm=use_norm,
+        ).to(device)
+        self.critic_target = copy.deepcopy(self.critic)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+
+        if use_multi_goal:
+            self.critic2 = Critic(
+                encoder=self.critic_encoder,
+                state_dim=state_dim,
+                action_dim=action_dim,
+                hidden_dim=hidden_dim,
+                use_norm=use_norm,
+            ).to(device)
+            self.critic2_target = copy.deepcopy(self.critic2)
+            self.critic2_optimizer = torch.optim.Adam(
+                self.critic2.parameters(), lr=critic_lr
+            )
+
+        if use_power_pred == 1:
+            self.predictor = PowerPredictor(
+                encoder=None,
+                state_dim=state_dim,
+                action_dim=action_dim,
+                hidden_dim=hidden_dim,
+                use_norm=use_norm,
+            ).to(device)
+            self.predictor_optimizer = torch.optim.Adam(
+                self.predictor.parameters(), lr=pred_lr
+            )
+
+        # Automatic entropy tuning
+        self.autotune = autotune
+        if autotune:
+            self.target_entropy = -action_dim
+            self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+            self.alpha = self.log_alpha.exp().item()
+            self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=actor_lr)
+        else:
+            self.alpha = alpha
+
+        self.max_action = max_action
+        self.min_action = min_action
+        self.discount = discount
+        self.tau = tau
+        self.use_actor_rnn = use_actor_rnn
+        self.use_critic_rnn = use_critic_rnn
+        self.actor_update_step = actor_update_step
+        self.reward_norm = reward_norm
+        self.use_power_pred = use_power_pred
+        self.pred_loss_weight = pred_loss_weight
+        self.use_action_mask = use_action_mask
+        self.use_multi_goal = use_multi_goal
+        self.multi_goal_weight = multi_goal_weight
+        self.n_step = n_step
+        self.time_enc_k = time_enc_k
+        self.train_step = 0
+
+    def select_action(
+        self,
+        state,
+        time_idx=None,
+        rnn_state=None,
+        critic_rnn_state=None,
+        deterministic=False,
+    ):
+        self.prep_rollout()
+        with torch.no_grad():
+            state = torch.as_tensor(state, device=device, dtype=torch.float32)
+            if self.time_enc_k > 0:
+                time_idx = torch.as_tensor(time_idx, device=device, dtype=torch.int32)
+                state = self.add_time_features(state, time_idx)
+            if rnn_state is not None:
+                rnn_state = torch.as_tensor(
+                    rnn_state, device=device, dtype=torch.float32
+                )
+            action, _, rnn_state = self.actor(state, rnn_state, deterministic, False)
+            if critic_rnn_state is not None:
+                critic_rnn_state = torch.as_tensor(
+                    critic_rnn_state, device=device, dtype=torch.float32
+                )
+                _, critic_rnn_state = self.critic.encode(state, critic_rnn_state)
+            return action, rnn_state, critic_rnn_state
+
+    def compute_q_value(self, state, action, critic_rnn_state=None):
+        self.prep_rollout()
+        with torch.no_grad():
+            state = torch.as_tensor(state, device=device, dtype=torch.float32)
+            action = torch.as_tensor(action, device=device, dtype=torch.float32)
+            if self.time_enc_k > 0:
+                time_idx = torch.as_tensor(time_idx, device=device, dtype=torch.int32)
+                state = self.add_time_features(state, time_idx)
+            if critic_rnn_state is not None:
+                critic_rnn_state = torch.as_tensor(
+                    critic_rnn_state, device=device, dtype=torch.float32
+                )
+            q1, q2 = self.critic(state, action, critic_rnn_state)
+            return torch.min(q1, q2)
+
+    def train(self, replay_buffer):
+        # Sample batches from replay buffer
+        data = replay_buffer.sample(discount=self.discount)
+
+        self.prep_training()
+        losses = {}
+
+        critic_losses = self.update_critic(data)
+        losses.update(critic_losses)
+
+        if self.use_multi_goal:
+            critic2_losses = self.update_critic2(data)
+            losses.update(critic2_losses)
+
+        if self.use_power_pred == 1:
+            pred_losses = self.update_predictor(data)
+            losses.update(pred_losses)
+
+        if self.train_step % self.actor_update_step == 0:
+            # Compute actor loss
+            actor_losses = self.update_actor(data)
+            losses.update(actor_losses)
+
+        # Update the frozen target models
+        for param, target_param in zip(
+            self.critic.parameters(), self.critic_target.parameters()
+        ):
+            target_param.data.copy_(
+                self.tau * param.data + (1 - self.tau) * target_param.data
+            )
+
+        self.train_step += 1
+
+        return losses
+
+    def update_critic(self, data):
+        state = data.obs
+        action = data.actions
+        next_state = data.next_obs
+        if self.reward_norm > 0:
+            reward = data.rewards / self.reward_norm
+        else:
+            reward = data.rewards
+        done = data.dones
+        action_masks = data.action_masks
+        time_idx = data.times
+        rnn_state = data.rnn_states
+        next_rnn_state = data.next_rnn_states
+        critic_rnn_state = data.critic_rnn_states
+        next_critic_rnn_state = data.next_critic_rnn_states
+
+        losses = {}
+
+        if self.time_enc_k > 0:
+            state = self.add_time_features(state, time_idx)
+            next_state = self.add_time_features(next_state, time_idx)
+
+        with torch.no_grad():
+            # Select action according to policy
+            next_action, next_logp_pi, _ = self.actor(next_state, next_rnn_state)
+            if self.use_action_mask:
+                next_action[:, 3:7] *= 1.0 - action_masks
+            # Compute the target Q value
+            target_Q1, target_Q2 = self.critic_target(
+                next_state, next_action, next_critic_rnn_state
+            )
+
+            target_Q = torch.min(target_Q1, target_Q2)
+            target_Q = reward + (1.0 - done) * (self.discount**self.n_step) * (
+                target_Q - self.alpha * next_logp_pi
+            )
+        # Get current Q estimates
+        if self.use_action_mask:
+            action[:, 3:7] *= 1.0 - action_masks
+        current_Q1, current_Q2 = self.critic(state, action, critic_rnn_state)
+        # Compute critic loss
+
+        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(
+            current_Q2, target_Q
+        )
+
+        # Optimize the critic
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+
+        # 打印梯度
+        for name, param in self.critic.named_parameters():
+            if param.grad is not None:
+                # print(f"critic: {name} 梯度: {param.grad.abs().mean()}")
+                losses[f"grad_critic_{name}"] = param.grad.abs().mean().item()
+
+        self.critic_optimizer.step()
+
+        losses["use_action_mask"] = self.use_action_mask
+        losses["action_mask_ratio"] = (
+            action_masks.sum(axis=-1) > 0
+        ).sum().item() / action_masks.shape[0]
+        losses["reward_scale"] = reward.abs().mean().item()
+        losses["q1_values"] = current_Q1.mean().item()
+        losses["q2_values"] = current_Q2.mean().item()
+        losses["q1_qtarg_ratio"] = current_Q1.mean().item() / target_Q.mean().item()
+        losses["q2_qtarg_ratio"] = current_Q2.mean().item() / target_Q.mean().item()
+        losses["critic_loss"] = critic_loss.item()
+
+        return losses
+
+    def update_actor(self, data):
+        state = data.obs
+        request = data.requests
+        action_masks = data.action_masks
+        time_idx = data.times
+        rnn_state = data.rnn_states
+        next_rnn_state = data.next_rnn_states
+        critic_rnn_state = data.critic_rnn_states
+        next_critic_rnn_state = data.next_critic_rnn_states
+
+        losses = {}
+
+        if self.time_enc_k > 0:
+            state = self.add_time_features(state, time_idx)
+            next_state = self.add_time_features(next_state, time_idx)
+
+        # Compute actor loss
+        action2, logp_pi, _ = self.actor(state, rnn_state)
+        if self.use_action_mask:
+            action2[:, 3:7] *= 1.0 - action_masks
+        Q1_pi, Q2_pi = self.critic(state, action2, critic_rnn_state)
+        Q_pi = torch.min(Q1_pi, Q2_pi)
+        actor_loss = -(Q_pi - self.alpha * logp_pi).mean()
+        if self.use_multi_goal:
+            mask = request > -1
+            if mask.any():
+                valid_state = state[mask]
+                valid_action2 = action2[mask]
+                if self.use_critic_rnn:
+                    valid_critic_rnn_state = critic_rnn_state[mask]
+                else:
+                    valid_critic_rnn_state = None
+                Q1_pi2, Q2_pi2 = self.critic2(
+                    valid_state, valid_action2, valid_critic_rnn_state
+                )
+                Q_pi2 = torch.min(Q1_pi2, Q2_pi2)
+            else:
+                Q_pi2 = torch.tensor(0.0, device=device, requires_grad=True)
+            actor_loss += self.multi_goal_weight * -(Q_pi2).mean()
+
+        if self.use_power_pred == 1:
+            mask = request > -1
+            if mask.any():
+                valid_state = state[mask]
+                valid_action2 = action2[mask]
+                valid_request = request[mask]
+                pred = self.predictor(valid_state, valid_action2, None)
+                rep_loss = ((pred - valid_request) ** 2).mean()
+            else:
+                rep_loss = torch.tensor(
+                    0.0, device=actor_loss.device, requires_grad=True
+                )
+            # rep_loss 和 actor_loss 不在同一个数量级
+            actor_loss += self.pred_loss_weight * rep_loss
+            losses["rep_loss"] = rep_loss.item()
+            losses["rep_mask_ratio"] = mask.sum().item() / mask.shape[0]
+
+        # Optimize the actor
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+
+        for name, param in self.actor.named_parameters():
+            if param.grad is not None:
+                # print(f"actor: {name} 梯度: {param.grad.abs().mean()}")
+                losses[f"grad_actor_{name}"] = param.grad.abs().mean().item()
+
+        self.actor_optimizer.step()
+
+        # 打印更新后的参数值
+        for name, param in self.actor.named_parameters():
+            # print(f"actor: {name} 更新后的值: {param.data.abs().mean()}")
+            losses[f"param_actor_{name}"] = param.data.abs().mean().item()
+
+        if self.autotune:
+            alpha_loss = (
+                -self.log_alpha.exp() * (logp_pi + self.target_entropy).detach()
+            ).mean()
+
+            self.log_alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.log_alpha_optimizer.step()
+
+            self.alpha = self.log_alpha.exp().item()
+
+        losses["actor_loss"] = actor_loss.item()
+        losses["logp_pi"] = logp_pi.mean().item()
+        losses["alpha_loss"] = alpha_loss.item()
+        losses["alpha"] = self.alpha
+
+        return losses
+
+    def update_predictor(self, data):
+        state = data.obs
+        action = data.actions
+        action_masks = data.action_masks
+        next_state = data.next_obs
+        request = data.requests
+        response = data.reps
+        time_idx = data.times
+
+        losses = {}
+
+        if self.time_enc_k > 0:
+            state = self.add_time_features(state, time_idx)
+            next_state = self.add_time_features(next_state, time_idx)
+
+        if self.use_action_mask:
+            action[:, 3:7] *= 1.0 - action_masks
+        pred_power = self.predictor(state, action, None)
+        # response 是实际功率的相反数，因此 -response 才是实际的功率
+        pred_loss = F.mse_loss(pred_power, -response)
+        pred_error = (pred_power + response).abs().mean()
+
+        # Optimize the predictor
+        self.predictor_optimizer.zero_grad()
+        pred_loss.backward()
+
+        # 打印梯度
+        for name, param in self.predictor.named_parameters():
+            if param.grad is not None:
+                # print(f"pred: {name} 梯度: {param.grad.abs().mean()}")
+                losses[f"grad_pred_{name}"] = param.grad.abs().mean().item()
+
+        self.predictor_optimizer.step()
+
+        # 打印更新后的参数值
+        for name, param in self.predictor.named_parameters():
+            # print(f"pred: {name} 更新后的值: {param.data.abs().mean()}")
+            losses[f"param_pred_{name}"] = param.data.abs().mean().item()
+
+        losses["pred_loss"] = pred_loss.item()
+        losses["pred_error"] = pred_error.item()
+
+        return losses
+
+    def prep_training(self):
+        self.actor.train()
+        self.critic.train()
+        if self.use_power_pred == 1:
+            self.predictor.train()
+
+    def prep_rollout(self):
+        self.actor.eval()
+        self.critic.eval()
+        if self.use_power_pred == 1:
+            self.predictor.eval()
+
+    # save the model
+    def save(self, path):
+        torch.save(self.actor.state_dict(), Path.joinpath(Path(path), "actor.pt"))
+        torch.save(self.critic.state_dict(), Path.joinpath(Path(path), "critic.pt"))
+        if self.autotune:
+            torch.save(self.log_alpha, Path.joinpath(Path(path), "log_alpha.pt"))
+        if self.use_power_pred == 1:
+            torch.save(
+                self.predictor.state_dict(), Path.joinpath(Path(path), "predictor.pt")
+            )
+
+    # load the model
+    def load(self, path, only_actor_critic=True):
+        self.actor.load_state_dict(
+            torch.load(Path.joinpath(Path(path), "actor.pt"), map_location=device)
+        )
+        self.critic.load_state_dict(
+            torch.load(Path.joinpath(Path(path), "critic.pt"), map_location=device)
+        )
+        if only_actor_critic:
+            return
+        self.critic_target = copy.deepcopy(self.critic)
+        if self.autotune:
+            self.log_alpha = torch.load(
+                Path.joinpath(Path(path), "log_alpha.pt"), map_location=device
+            )
+        if self.use_power_pred == 1:
+            self.predictor.load_state_dict(
+                torch.load(
+                    Path.joinpath(Path(path), "predictor.pt"), map_location=device
+                )
+            )
+
+    def add_time_features(self, state: torch.Tensor, t_idx: torch.Tensor):
+        """
+        state: (B, D) 原始观测
+        t_idx: (B,) 0..95 的时间步
+        return: (B, D + 2K) 拼接后的观测
+        """
+        theta = 2 * math.pi * t_idx.float().unsqueeze(-1) / 96.0  # (B,1)
+        feats = [torch.sin(theta), torch.cos(theta)]
+        for k in range(2, self.time_enc_k + 1):
+            ktheta = k * theta
+            feats += [torch.sin(ktheta), torch.cos(ktheta)]
+        time_feats = torch.cat(feats, dim=-1)  # (B, 2K)
+        return torch.cat([state, time_feats], dim=-1)
+
+    def update_critic2(self, data):
+        state = data.obs
+        request = data.requests
+        action = data.actions
+        next_state = data.next_obs
+        if self.reward_norm > 0:
+            reward = data.req_rewards / self.reward_norm
+        else:
+            reward = data.req_rewards
+        done = data.dones
+        action_masks = data.action_masks
+        time_idx = data.times
+        rnn_state = data.rnn_states
+        next_rnn_state = data.next_rnn_states
+        critic_rnn_state = data.critic_rnn_states
+        next_critic_rnn_state = data.next_critic_rnn_states
+
+        losses = {}
+
+        if self.time_enc_k > 0:
+            state = self.add_time_features(state, time_idx)
+            next_state = self.add_time_features(next_state, time_idx)
+
+        mask = request > -1
+        if not mask.any():
+            return losses
+        valid_state = state[mask]
+        valid_action = action[mask]
+        valid_action_masks = action_masks[mask]
+        valid_reward = reward[mask]
+        valid_done = done[mask]
+        valid_next_state = next_state[mask]
+        if self.use_actor_rnn:
+            valid_next_rnn_state = next_rnn_state[mask]
+        else:
+            valid_next_rnn_state = None
+        if self.use_critic_rnn:
+            valid_critic_rnn_state = critic_rnn_state[mask]
+            valid_next_critic_rnn_state = next_critic_rnn_state[mask]
+        else:
+            valid_critic_rnn_state = None
+            valid_next_critic_rnn_state = None
+        with torch.no_grad():
+            # Select action according to policy
+            next_action, next_logp_pi, _ = self.actor(
+                valid_next_state, valid_next_rnn_state
+            )
+            if self.use_action_mask:
+                next_action[:, 3:7] *= 1.0 - valid_action_masks
+            # Compute the target Q value
+            target_Q1, target_Q2 = self.critic2_target(
+                valid_next_state, next_action, valid_next_critic_rnn_state
+            )
+
+            target_Q = torch.min(target_Q1, target_Q2)
+            target_Q = valid_reward + (1.0 - valid_done) * self.discount * (
+                target_Q - self.alpha * next_logp_pi
+            )
+        # Get current Q estimates
+        if self.use_action_mask:
+            valid_action[:, 3:7] *= 1.0 - valid_action_masks
+        current_Q1, current_Q2 = self.critic2(
+            valid_state, valid_action, valid_critic_rnn_state
+        )
+        # Compute critic2 loss
+
+        critic2_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(
+            current_Q2, target_Q
+        )
+
+        # Optimize the critic2
+        self.critic2_optimizer.zero_grad()
+        critic2_loss.backward()
+
+        # 打印梯度
+        for name, param in self.critic2.named_parameters():
+            if param.grad is not None:
+                # print(f"critic2: {name} 梯度: {param.grad.abs().mean()}")
+                losses[f"grad_critic2_{name}"] = param.grad.abs().mean().item()
+
+        self.critic2_optimizer.step()
+
+        losses["critic2_use_action_mask"] = self.use_action_mask
+        losses["critic2_action_mask_ratio"] = (
+            valid_action_masks.sum(axis=-1) > 0
+        ).sum().item() / valid_action_masks.shape[0]
+        losses["critic2_reward_scale"] = valid_reward.abs().mean().item()
+        losses["critic2_q1_values"] = current_Q1.mean().item()
+        losses["critic2_q2_values"] = current_Q2.mean().item()
+        losses["critic2_q1_qtarg_ratio"] = (
+            current_Q1.mean().item() / target_Q.mean().item()
+        )
+        losses["critic2_q2_qtarg_ratio"] = (
+            current_Q2.mean().item() / target_Q.mean().item()
+        )
+        losses["critic2_loss"] = critic2_loss.item()
+
+        return losses

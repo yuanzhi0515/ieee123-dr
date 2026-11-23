@@ -1,0 +1,4 @@
+BusNo,MaxE,max_P,min_P,max_Q,min_Q,charge_rate,discharge_rate,min_SoC,max_SoC,init_SoC,rtd_P,Region,Cal
+37,4,0.3,-0.3,0,0,0.95,0.9,0.1,0.9,20,0,3,RL
+56,4,0.2,-0.2,0,0,0.95,0.9,0.1,0.9,20,0,4,RL
+85,3,0.3,-0.3,0,0,0.95,0.9,0.1,0.9,20,0,6,RL
